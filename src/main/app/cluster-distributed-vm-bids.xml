@@ -1,0 +1,311 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- Bidding application Receives a POSTed list of bids in through AuctionService 
+	Enriches each bid then scans the final bids to locate the highest bidder 
+	The highest bidder is returned back to the client Running the application: 
+	- start two mule instances in a cluster, each with a unique http.port - POST 
+	bid data to http:listener; bid example can be found in src/main/resources 
+	This application can be used to demo: - impacts of processing-strategy with 
+	a VM profiler. - how clusters / CH handles distributing load with VM endpoints 
+	- impact of using a cluster-aware cache in on-prem - asynchronous processing 
+	of a synchronous http request -->
+
+<mule xmlns:quartz="http://www.mulesoft.org/schema/mule/quartz"
+	xmlns:objectstore="http://www.mulesoft.org/schema/mule/objectstore"
+	xmlns:scripting="http://www.mulesoft.org/schema/mule/scripting"
+	xmlns:file="http://www.mulesoft.org/schema/mule/file" xmlns:context="http://www.springframework.org/schema/context"
+	xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking"
+	xmlns:vm="http://www.mulesoft.org/schema/mule/vm" xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/quartz http://www.mulesoft.org/schema/mule/quartz/current/mule-quartz.xsd
+http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context-current.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+http://www.mulesoft.org/schema/mule/scripting http://www.mulesoft.org/schema/mule/scripting/current/mule-scripting.xsd
+http://www.mulesoft.org/schema/mule/objectstore http://www.mulesoft.org/schema/mule/objectstore/current/mule-objectstore.xsd">
+
+	<context:property-placeholder location="default.properties, ${env}.properties, ops-bid-processing-distributed-${env}.properties"
+		ignore-resource-not-found="true" />
+
+
+
+<!-- 	<spring:beans>
+		<spring:bean id="myListableObjectStore"
+			class="org.mule.util.store.SimpleMemoryObjectStore" />
+	</spring:beans>
+ -->
+ 
+<!-- 
+	<objectstore:config name="ObjectStore" persistent="true"
+		doc:name="ObjectStore: Configuration" />
+
+ -->	<!-- allow for higher parallel execution -->
+	<queued-asynchronous-processing-strategy
+		name="highThroughputProcessing" maxThreads="80" minThreads="16"
+		threadTTL="10000" doc:name="High Throughput Asynchronous Processing Strategy" />
+
+
+
+	<http:listener-config name="HTTP_Listener_Configuration"
+		host="0.0.0.0" port="${http.port}" doc:name="HTTP Listener Configuration"
+		connectionIdleTimeout="${http.timeout}" />
+
+
+	<http:request-config name="HTTP_Request_Configuration"
+		host="localhost" port="${http.port}" doc:name="HTTP Request Configuration" connectionIdleTimeout="300000" responseTimeout="300000"/>
+
+
+
+
+
+	<flow name="http-get-initiate-reading-and-parsing-bids-file">
+		<http:listener config-ref="HTTP_Listener_Configuration"
+			path="/bids/{bidfile}" allowedMethods="GET" doc:name="HTTP" />
+		<set-variable variableName="bidfile"
+			value="#[message.inboundProperties.'http.uri.params'.bidfile]"
+			doc:name="set bidfile" />
+        <tracking:custom-event event-name="ReceiveBidsFileFromHTTPPost" doc:name="Custom Business Events">
+            <tracking:meta-data key="bidCounter" value="#[sessionVars.bidCounter]"/>
+            <tracking:meta-data key="mule.nodeId" value="#[mule.nodeId]"/>
+            <tracking:meta-data key="server.ip" value="#[server.ip]"/>
+            <tracking:meta-data key="server.host" value="#[server.host]"/>
+            <tracking:meta-data key="mule.clusterId" value="#[mule.clusterId]"/>
+            <tracking:meta-data key="bidsID" value="#[sessionVars.bidsProcessID]"/>
+            <tracking:meta-data key="message:correlationSequence" value="#[message.correlationSequence]"/>
+            <tracking:meta-data key="message:id" value="#[message.id]"/>
+            <tracking:meta-data key="message:rootId" value="#[message.rootId]"/>
+            <tracking:meta-data key="message:correlationId" value="#[message.correlationId]"/>
+            <tracking:meta-data key="message:correlationGroupSize" value="#[message.correlationGroupSize]"/>
+        </tracking:custom-event>
+		<set-payload
+			value="#[Thread.currentThread().getContextClassLoader().getResourceAsStream(flowVars.bidfile)]"
+			doc:name="Set Payload" />
+		<byte-array-to-string-transformer
+			doc:name="Byte Array to String" />
+		<logger
+			message="#['\n\n&gt;&gt;&gt;&gt;Message:'+message.id+'-Mule node:'+mule.nodeId+' [initial file parsing flow].\n           Bids file read into memory. Posting bids to be processed to HTTP URL /bids...']"
+			level="INFO" category="com.mulesoft.training.opsbids" doc:name="Logger" />
+		<http:request config-ref="HTTP_Request_Configuration"
+			path="/bids" method="POST" doc:name="HTTP">
+			<http:request-builder>
+                <http:header headerName="Content-Type" value="text/plain"/>
+			</http:request-builder>
+		</http:request>
+	</flow>
+
+
+	<flow name="http-get-return-valid-bids-filenames">
+		<http:listener config-ref="HTTP_Listener_Configuration"
+			path="/bids/" allowedMethods="GET" doc:name="HTTP" />
+		<set-payload
+			value="#['URL is /bids/bids.txt, /bids/bids_large.txt or /bids/bids_large2.txt']"
+			doc:name="Set Payload" />
+		<logger
+			message="#['\n\n&gt;&gt;&gt;&gt;Message:'+message.id+'-Mule node:'+mule.nodeId+'[http-get-return-valid-bids-filenames]. Test data file names are: /bids/bids.txt, /bids/bids_large.txt or /bids/bids_large2.txt']"
+			level="INFO" category="com.mulesoft.training.opsbids" doc:name="Logger" />
+	</flow>
+
+	<flow name="handle-http-post-of-bids-file-data">
+
+		<http:listener config-ref="HTTP_Listener_Configuration"
+			path="/bids" doc:name="HTTP" allowedMethods="POST" />
+
+
+		<!-- <scripting:component doc:name="Groovy"> <scripting:script engine="Groovy"><![CDATA[muleContext.getRegistry().registerObject("counter", 
+			new Integer(0)) message]]></scripting:script> </scripting:component> -->
+
+		<!--  <set-variable variableName="counter" value="#[0]"
+			doc:name="initialize counter" />
+		-->
+        <tracking:custom-event event-name="SendBidsFileForProcessing" doc:name="SendBidsFileForProcessing">
+            <tracking:meta-data key="bidCounter" value="#[sessionVars.bidCounter]"/>
+            <tracking:meta-data key="mule.nodeId" value="#[mule.nodeId]"/>
+            <tracking:meta-data key="server.ip" value="#[server.ip]"/>
+            <tracking:meta-data key="server.host" value="#[server.host]"/>
+            <tracking:meta-data key="mule.clusterId" value="#[mule.clusterId]"/>
+            <tracking:meta-data key="bidsID" value="#[sessionVars.bidsProcessID]"/>
+            <tracking:meta-data key="message:correlationSequence" value="#[message.correlationSequence]"/>
+            <tracking:meta-data key="message:id" value="#[message.id]"/>
+            <tracking:meta-data key="message:rootId" value="#[message.rootId]"/>
+            <tracking:meta-data key="message:correlationId" value="#[message.correlationId]"/>
+            <tracking:meta-data key="message:correlationGroupSize" value="#[message.correlationGroupSize]"/>
+        </tracking:custom-event>
+		<set-session-variable variableName="bidsProcessID"
+			value="#['***BIDS-batch-message'+message.id+'-'+server.dateTime+'-nodeId'+mule.nodeId+'-clusterId'+mule.clusterId+'-serverIP '+server.ip+'***']"
+			doc:name="set bid batch identifier" />
+		<set-session-variable variableName="bidCounter"
+			value="#[0]" doc:name="set bidCounter session variable" />
+
+		<object-to-string-transformer doc:name="Object to String" />
+
+
+		<logger
+			message="#['\n\n&gt;&gt;&gt;&gt;Message:'+message.id+'-Mule node:'+mule.nodeId+'[handle-http-post-of-bids-file-data]\n          '+sessionVars.bidsProcessID+'Bids received: sending to Request-Reply scope \'split\' VM queue: \n             '+message.payload]"
+			level="INFO" doc:name="Logger" category="com.mulesoft.training.opsbids" />
+        <async processingStrategy="highThroughputProcessing" doc:name="Async">
+            <vm:outbound-endpoint exchange-pattern="one-way" path="split" doc:name="send all bids to split queue"/>
+        </async>
+		<set-payload
+			value="#['&lt;h1&gt; Batch Processing Bids Demo&lt;/h1&gt;Bid batch job submitted with ID: '+sessionVars.bidsProcessID+'  :  &lt;P&gt; &lt;h2&gt;Payload&lt;/h2&gt; '+ message.payload]"
+			doc:name="Set Payload" mimeType="text/html"/>
+        <logger message="#['\n\n&gt;&gt;&gt;&gt;Message:'+message.id+'-Mule node:'+mule.nodeId+'[split-bids flow]\n       waiting for Highest Bid response']" level="INFO" category="com.mulesoft.training.opsbids" doc:name="Logger"/>
+
+	</flow>
+
+
+	<flow name="split-bids" processingStrategy="highThroughputProcessing">
+		<vm:inbound-endpoint exchange-pattern="one-way"
+			path="split" doc:name="receive from split queue" />
+        <tracking:custom-event event-name="BeforeSplitMessage" doc:name="BeforeSplitMessage">
+            <tracking:meta-data key="bidCounter" value="#[sessionVars.bidCounter]"/>
+            <tracking:meta-data key="mule.nodeId" value="#[mule.nodeId]"/>
+            <tracking:meta-data key="server.ip" value="#[server.ip]"/>
+            <tracking:meta-data key="server.host" value="#[server.host]"/>
+            <tracking:meta-data key="mule.clusterId" value="#[mule.clusterId]"/>
+            <tracking:meta-data key="bidsID" value="#[sessionVars.bidsProcessID]"/>
+            <tracking:meta-data key="message:correlationSequence" value="#[message.correlationSequence]"/>
+            <tracking:meta-data key="message:id" value="#[message.id]"/>
+            <tracking:meta-data key="message:rootId" value="#[message.rootId]"/>
+            <tracking:meta-data key="message:correlationId" value="#[message.correlationId]"/>
+            <tracking:meta-data key="message:correlationGroupSize" value="#[message.correlationGroupSize]"/>
+        </tracking:custom-event>
+        
+        
+		<splitter expression="#[groovy:payload.readLines()]"
+			doc:name="split each line into a bid" />
+			
+			
+        <tracking:custom-event event-name="AfterSplitMessage" doc:name="AfterSplitMessage">
+            <tracking:meta-data key="bidCounter" value="#[sessionVars.bidCounter]"/>
+            <tracking:meta-data key="mule.nodeId" value="#[mule.nodeId]"/>
+            <tracking:meta-data key="server.ip" value="#[server.ip]"/>
+            <tracking:meta-data key="server.host" value="#[server.host]"/>
+            <tracking:meta-data key="mule.clusterId" value="#[mule.clusterId]"/>
+            <tracking:meta-data key="bidsID" value="#[sessionVars.bidsProcessID]"/>
+            <tracking:meta-data key="message:correlationSequence" value="#[message.correlationSequence]"/>
+            <tracking:meta-data key="message:id" value="#[message.id]"/>
+            <tracking:meta-data key="message:rootId" value="#[message.rootId]"/>
+            <tracking:meta-data key="message:correlationId" value="#[message.correlationId]"/>
+            <tracking:meta-data key="message:correlationGroupSize" value="#[message.correlationGroupSize]"/>
+        </tracking:custom-event>
+		<set-session-variable variableName="bidCounter"
+			value="#[sessionVars.bidCounter + 1]" doc:name="increment bidCounter sessionVar" />
+		<logger
+			message="#['\n\n&gt;&gt;&gt;&gt;Message:'+message.id+'-Mule node:'+mule.nodeId+'[split-bids flow]\n          '+'Split Bids with ID:\n          '+sessionVars.bidsProcessID+'-number of bids: '+sessionVars.bidCounter+':\n          custom BusinessEvents created with '+message.payload+'. \n          Split message: current message correlationID is:'+message.correlationId+', correlationGroupSize: '+message.correlationGroupSize+', message correlation sequence: '+message.correlationSequence+', \n          Now sending bid to \'process\' VM queue']"
+			level="INFO" category="com.mulesoft.training.opsbids" doc:name="Logger" />
+        <vm:outbound-endpoint exchange-pattern="one-way" path="process" doc:name="send to process queue"/>
+	</flow>
+
+	<!-- add user information (enrich) bids; locate the highest bidder; respond 
+		back to AuctionService -->
+	<!-- do not make this processingStrategy="QueuedHighThroughput" -->
+	<!-- 2016 feb 12: There is a bug that will change all the flow processing 
+		strategies to this processing strategy -->
+	<flow name="process-bids" tracking:enable-default-events="true"
+		processingStrategy="highThroughputProcessing">
+		<vm:inbound-endpoint exchange-pattern="one-way"
+			path="process" doc:name="receive from process queue" />
+        <tracking:custom-event event-name="BeforeBidEnriched" doc:name="Copy_of_AfterBidEnriched">
+            <tracking:meta-data key="bidCounter" value="#[sessionVars.bidCounter]"/>
+            <tracking:meta-data key="mule.nodeId" value="#[mule.nodeId]"/>
+            <tracking:meta-data key="server.ip" value="#[server.ip]"/>
+            <tracking:meta-data key="server.host" value="#[server.host]"/>
+            <tracking:meta-data key="mule.clusterId" value="#[mule.clusterId]"/>
+            <tracking:meta-data key="bidsID" value="#[sessionVars.bidsProcessID]"/>
+            <tracking:meta-data key="message:correlationSequence" value="#[message.correlationSequence]"/>
+            <tracking:meta-data key="message:id" value="#[message.id]"/>
+            <tracking:meta-data key="message:rootId" value="#[message.rootId]"/>
+            <tracking:meta-data key="message:payload-enriched" value="#[message.payload]"/>
+            <tracking:meta-data key="message:correlationId" value="#[message.correlationId]"/>
+            <tracking:meta-data key="message:correlationGroupSize" value="#[message.correlationGroupSize]"/>
+        </tracking:custom-event>
+
+		<!-- <scripting:component doc:name="Groovy"> <scripting:script engine="Groovy"><![CDATA[Integer 
+			currentCounter = muleContext.getRegistry().lookupObject("counter"); currentCounter 
+			= new Integer( currentCounter.intValue() + 1 ); muleContext.getRegistry().registerObject("counter", 
+			currentCounter); System.out.println("\n\n"+currentCounter.intValue()); message;]]></scripting:script> 
+			</scripting:component> -->
+		<component class="com.mulesoft.EnricherAuctionComponent"
+			doc:name="EnrichBids Java Component" />
+        <tracking:custom-event event-name="AfterBidEnriched" doc:name="AfterBidEnriched">
+            <tracking:meta-data key="bidCounter" value="#[sessionVars.bidCounter]"/>
+            <tracking:meta-data key="mule.nodeId" value="#[mule.nodeId]"/>
+            <tracking:meta-data key="server.ip" value="#[server.ip]"/>
+            <tracking:meta-data key="server.host" value="#[server.host]"/>
+            <tracking:meta-data key="mule.clusterId" value="#[mule.clusterId]"/>
+            <tracking:meta-data key="bidsID" value="#[sessionVars.bidsProcessID]"/>
+            <tracking:meta-data key="message:correlationSequence" value="#[message.correlationSequence]"/>
+            <tracking:meta-data key="message:id" value="#[message.id]"/>
+            <tracking:meta-data key="message:rootId" value="#[message.rootId]"/>
+            <tracking:meta-data key="message:payload-enriched" value="#[message.payload]"/>
+            <tracking:meta-data key="message:correlationId" value="#[message.correlationId]"/>
+            <tracking:meta-data key="message:correlationGroupSize" value="#[message.correlationGroupSize]"/>
+        </tracking:custom-event>
+		<expression-component doc:name="Sleep 1 sec"><![CDATA[Thread.sleep(${process.timer});]]></expression-component>
+		<logger
+			message="#['\n\n&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;Message:'+message.id+'-Mule node:'+mule.nodeId+'--process-bids flow:\n          '+sessionVars.bidsProcessID+'\n      Collecting Bids with counter= '+sessionVars.bidCounter+'\n          Split message '+message.id+' with correlationId: '+message.correlationId+', correlationGroupSize: '+message.correlationGroupSize+', correlationSequence: '+message.correlationSequence+'\n          payload='+message.payload]"
+			level="INFO" category="com.mulesoft.training.opsbids" doc:name="Logger" />
+        <choice doc:name="Choice">
+            <when expression="#['${enable.highestbids.aggregator}' == 'true']">
+                <collection-aggregator timeout="100000" failOnTimeout="true" doc:name="Collection Aggregator"/>
+                <tracking:custom-event event-name="AfterBidsCollected" doc:name="AfterBidsCollected">
+                    <tracking:meta-data key="bidCounter" value="#[sessionVars.bidCounter]"/>
+                    <tracking:meta-data key="mule.nodeId" value="#[mule.nodeId]"/>
+                    <tracking:meta-data key="server.ip" value="#[server.ip]"/>
+                    <tracking:meta-data key="server.host" value="#[server.host]"/>
+                    <tracking:meta-data key="mule.clusterId" value="#[mule.clusterId]"/>
+                    <tracking:meta-data key="bidsID" value="#[sessionVars.bidsProcessID]"/>
+                    <tracking:meta-data key="message:correlationSequence" value="#[message.correlationSequence]"/>
+                    <tracking:meta-data key="message:id" value="#[message.id]"/>
+                    <tracking:meta-data key="message:rootId" value="#[message.rootId]"/>
+                    <tracking:meta-data key="message:payload-enriched" value="#[message.payload]"/>
+                    <tracking:meta-data key="message:correlationId" value="#[message.correlationId]"/>
+                    <tracking:meta-data key="message:correlationGroupSize" value="#[message.correlationGroupSize]"/>
+                </tracking:custom-event>
+                <component class="com.mulesoft.HighestBidderAuctionComponent" doc:name="Highest Bidder Java Component"/>
+                <set-session-variable variableName="highestBid" value="#[message.payload]" doc:name="Session Variable"/>
+                <tracking:custom-event event-name="AfterHighestBidderCalculated" doc:name="AfterHighestBidderCalculated">
+                    <tracking:meta-data key="bidCounter" value="#[sessionVars.bidCounter]"/>
+                    <tracking:meta-data key="mule.nodeId" value="#[mule.nodeId]"/>
+                    <tracking:meta-data key="server.ip" value="#[server.ip]"/>
+                    <tracking:meta-data key="server.host" value="#[server.host]"/>
+                    <tracking:meta-data key="mule.clusterId" value="#[mule.clusterId]"/>
+                    <tracking:meta-data key="bidsID" value="#[sessionVars.bidsProcessID]"/>
+                    <tracking:meta-data key="message:correlationSequence" value="#[message.correlationSequence]"/>
+                    <tracking:meta-data key="message:id" value="#[message.id]"/>
+                    <tracking:meta-data key="message:rootId" value="#[message.rootId]"/>
+                    <tracking:meta-data key="message:payload-enriched" value="#[message.payload]"/>
+                    <tracking:meta-data key="message:correlationId" value="#[message.correlationId]"/>
+                    <tracking:meta-data key="message:correlationGroupSize" value="#[message.correlationGroupSize]"/>
+                </tracking:custom-event>
+                <logger message="#['\n\n&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;FINAL Message:'+message.id+'-Mule node:'+mule.nodeId+'--process-bids flow:\n          '+sessionVars.bidsProcessID+'\n             Current processBids ='+sessionVars.bidCounter+':\n              after Highest Bidder Java Component - sending reply to highest-bid-response VM Queue'+message.payload]" level="INFO" category="com.mulesoft.training.opsbids" doc:name="Logger"/>
+            </when>
+            <otherwise>
+                <logger message="Collection Aggregator skipped" level="INFO" category="com.mulesoft.training.opsbids" doc:name="Logger"/>
+                <set-payload value="ops-bids completed" doc:name="Set Payload"/>
+            </otherwise>
+        </choice>
+		<tracking:transaction id="myApp" />
+	</flow>
+
+
+	<!-- <flow name="update-counter-object" processingStrategy="QueuedHighThroughput" 
+		doc:description="Next version: replace sessionVar with object store"> <objectstore:remove 
+		key="counterObject" config-ref="ObjectStore" ignoreNotExists="true" doc:name="Remove 
+		if exists" /> <objectstore:store config-ref="ObjectStore" key="counterObject" 
+		value-ref="#[flowVars.counter]" doc:name="Store new value" overwrite="true" 
+		/> </flow> <flow name="get-counter-object" doc:description="Next version: 
+		replace sessionVar with object store" processingStrategy="QueuedHighThroughput"> 
+		<objectstore:retrieve config-ref="ObjectStore" key="counterObject" doc:name="Get 
+		value from ObjectStore" targetProperty="#[flowVars.counter]" /> <logger level="INFO" 
+		doc:name="Logger" message="Retrieved object store value" /> </flow> -->
+
+
+
+
+</mule>

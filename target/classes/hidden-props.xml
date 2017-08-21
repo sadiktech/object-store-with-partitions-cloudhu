@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:metadata="http://www.mulesoft.org/schema/mule/metadata"
+	xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw" xmlns:context="http://www.springframework.org/schema/context"
+	xmlns:scripting="http://www.mulesoft.org/schema/mule/scripting"
+	xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+	xmlns:secure-property-placeholder="http://www.mulesoft.org/schema/mule/secure-property-placeholder"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+
+	xsi:schemaLocation="http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context-current.xsd
+http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/secure-property-placeholder http://www.mulesoft.org/schema/mule/secure-property-placeholder/current/mule-secure-property-placeholder.xsd
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+http://www.mulesoft.org/schema/mule/scripting http://www.mulesoft.org/schema/mule/scripting/current/mule-scripting.xsd
+http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd">
+
+	<configuration doc:name="Configuration">
+		<expression-language>
+			<global-functions>
+				def originalMessage() {
+				return message.originalMessage
+				}
+
+				def messageId() {
+				return message.id
+				}
+
+				def messagePayload() {
+				return message.payload
+				}
+				def addition(a,b) {
+				return a + b
+				}
+			</global-functions>
+		</expression-language>
+	</configuration>
+
+
+	<http:listener-config name="HTTP_Listener_Configuration"
+		host="0.0.0.0" port="${http.port}" doc:name="HTTP Listener Configuration" />
+    <context:property-placeholder location="hidden-props.properties"/>
+
+
+
+
+	<flow name="one-flow">
+		<http:listener config-ref="HTTP_Listener_Configuration"
+			path="${input.path}" allowedMethods="GET" doc:name="HTTP" />
+
+
+		<set-variable variableName="db1Password" value="#['${db1.password}']"
+			doc:name="Set db1Password" />
+        <set-variable variableName="db1User" value="#['${db1.user}']" doc:name="Set db1User"/>
+		<set-payload value="#['TEST Payload - This is completely replaced by the next flow']" doc:name="Set Payload" />
+
+		<flow-ref name="parseReplyPayload" doc:name="parseReplyPayload" />
+	</flow>
+	<sub-flow name="parseReplyPayload">
+
+
+		<enricher target="flowVars.htmlHeader" doc:name="Message Enricher">
+			<parse-template location="header.html" doc:name="Parse css header" />
+
+		</enricher>
+
+
+
+		<enricher target="flowVars.messageResponse" doc:name="Message Enricher">
+			<parse-template location="response.html" doc:name="Parse response" />
+		</enricher>
+		<enricher target="flowVars.appProperties" doc:name="Message Enricher">
+			<flow-ref name="parseAppProperties" doc:name="parseAppProperties" />
+		</enricher>
+		<enricher target="flowVars.footer" doc:name="Message Enricher">
+			<parse-template location="footer.html" doc:name="parse footer" />
+		</enricher>
+        <set-payload value="#[flowVars.htmlHeader+flowVars.messageResponse+'&lt;HR&gt; &lt;h2&gt;hidden-props.properties content: &lt;/h2&gt;'+flowVars.appProperties]" doc:name="Set Payload"/>
+	</sub-flow>
+	<sub-flow name="parseAppProperties">
+		<parse-template location="hidden-props.properties" doc:name="Parse hidden-props.properties" />
+		<byte-array-to-string-transformer
+			doc:name="Byte Array to String" />
+	</sub-flow>
+
+</mule>
